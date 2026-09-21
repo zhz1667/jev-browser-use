@@ -16,7 +16,7 @@ const clickRoles = new Set(['button','link','checkBox','checkbox','radio button'
 const safeKeys = new Set(['Enter','Escape','Tab','Shift+Tab','PageUp','PageDown','Home','End']);
 
 function parseState(state) {
-  return state.split('\n').map(line => line.trim()).map(line => line.match(/^(\d+) (text field|text area|combo box|radio button|menu item|[\w]+)(?: \([^)]*\))? (?:Description: )?(.*)$/)).filter(Boolean).map(match => ({index:Number(match[1]),role:match[2],name:match[3]}));
+  return state.split('\n').map(line => line.trim()).map(line => line.match(/^(\d+) (text field|text area|combo box|radio button|menu item|[\w]+)(?: \([^)]*\))? (?:Description: )?(.*)$/)).filter(Boolean).map(match => ({index:Number(match[1]),role:match[2],name:match[3].trim()}));
 }
 
 function controlNames(control) {
@@ -24,11 +24,11 @@ function controlNames(control) {
 }
 
 function matchesName(observed, expected) {
-  return observed === expected || observed?.startsWith(`${expected}, Value:`);
+  return observed === expected || observed?.startsWith(`${expected}, Value:`) || observed?.startsWith(`${expected}, ID:`);
 }
 
 function semanticName(name) {
-  return name.replace(/, Value:.*$/, '');
+  return name.replace(/,\s*(?:Value|ID):.*$/, '');
 }
 
 function matchesPattern(name, pattern) {
@@ -148,13 +148,13 @@ export function discoverActions(state, policy={}) {
 async function execute(tab, action) {
   if (action.op === 'click') await tab.click(action.index);
   else if (action.op === 'scroll' && action.target !== undefined) await tab.scroll(action.target,action.direction,action.amount ?? 1);
-  else if (action.op === 'scroll') for (let i=0;i<(action.amount ?? 1);i++) await tab.pressKey(action.direction === 'down' ? 'PageDown' : 'PageUp');
-  else if (action.op === 'press') await tab.pressKey(action.key);
+  else if (action.op === 'scroll') for (let i=0;i<(action.amount ?? 1);i++) await tab.pressKey(null,action.direction === 'down' ? 'PageDown' : 'PageUp');
+  else if (action.op === 'press') await tab.pressKey(null,action.key);
   else if (action.op === 'reload') await tab.reload();
 }
 
 function handoff(status) {
-  return ({low_confidence:'low_confidence',blocked:'model_blocked',no_progress:'no_progress',loading_timeout:'loading_timeout',decision_error:'decision_error',action_error:'action_error',budget:'budget',step_limit:'step_limit'})[status] ?? null;
+  return ({low_confidence:'low_confidence',blocked:'model_blocked',origin_blocked:'origin_blocked',no_progress:'no_progress',loading_timeout:'loading_timeout',decision_error:'decision_error',action_error:'action_error',budget:'budget',step_limit:'step_limit'})[status] ?? null;
 }
 
 function result(status,history,state,startedAt,details={}) {
@@ -170,7 +170,12 @@ export async function run(tab,{goal,controls=[],policy,envFile,provider,model,al
   let decisionRetries = 0;
   let state = await tab.getAXState({emit:false,disableDiffing:true});
   for (let step=0;step<maxSteps;step++) {
-    checkState(state,allowedOrigins);
+    try {
+      checkState(state,allowedOrigins);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'Browser left authorized origins') return result('origin_blocked',history,state,startedAt,{error:error.message});
+      throw error;
+    }
     if (performance.now()-startedAt > maxMs) return result('budget',history,state,startedAt);
     const actions = [...availableActions(state,controls),...discoverActions(state,policy)].filter((action,index,all) => {
       const key = `${action.op}:${action.index ?? ''}:${action.direction ?? ''}:${action.amount ?? ''}:${action.key ?? ''}:${String(action.target ?? '')}`;
@@ -195,8 +200,17 @@ export async function run(tab,{goal,controls=[],policy,envFile,provider,model,al
     }
     decisionRetries = 0;
     const record = {provider:decision.provider,choice:decision.choice,confidence:decision.confidence,model:decision.model,apiMs:decision.apiMs,action:decision.action?.description ?? decision.choice};
-    const fresh = await tab.getAXState({emit:false,disableDiffing:true});
-    checkState(fresh,allowedOrigins);
+    let fresh;
+    try {
+      fresh = await tab.getAXState({emit:false,disableDiffing:true});
+      checkState(fresh,allowedOrigins);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'Browser left authorized origins') {
+        history.push({...record,executed:false,reason:'origin_blocked'});
+        return result('origin_blocked',history,fresh,startedAt,{error:error.message});
+      }
+      throw error;
+    }
     if (performance.now()-startedAt >= maxMs) return result('budget',history,fresh,startedAt);
     if (fresh !== state) { history.push({...record,executed:false,reason:'stale_state'}); state=fresh; continue; }
     if (decision.confidence < minConfidence) return result('low_confidence',[...history,record],state,startedAt);
@@ -219,8 +233,17 @@ export async function run(tab,{goal,controls=[],policy,envFile,provider,model,al
       return result('action_error',history,state,startedAt,{error:error instanceof Error ? error.message : 'Action failed'});
     }
     history.push({...record,executed:true});
-    const next = await tab.getAXState({emit:false,disableDiffing:true});
-    checkState(next,allowedOrigins);
+    let next;
+    try {
+      next = await tab.getAXState({emit:false,disableDiffing:true});
+      checkState(next,allowedOrigins);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'Browser left authorized origins') {
+        history[history.length-1].reason = 'origin_blocked';
+        return result('origin_blocked',history,next,startedAt,{error:error.message});
+      }
+      throw error;
+    }
     if (next === state) {
       if (decision.action.op === 'scroll') history[history.length-1].effectNeedsVisualVerification = true;
       else history[history.length-1].noEffect = true;
